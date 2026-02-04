@@ -1,0 +1,10 @@
+{
+	"name": "create_lead_function",
+	"version": "1.0.0",
+	"main": "index.js",
+	"author": "info@sanganigroup.in",
+	"dependencies": {
+		"nodemailer": "^6.9.8",
+		"zcatalyst-sdk-node": "latest"
+	}
+}

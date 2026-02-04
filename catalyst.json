@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "targets": [
+      "create_lead_function"
+    ],
+    "ignore": [],
+    "source": "functions"
+  }
+}
