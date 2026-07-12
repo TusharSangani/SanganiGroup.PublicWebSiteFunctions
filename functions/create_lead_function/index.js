@@ -1,38 +1,70 @@
 ﻿const nodemailer = require('nodemailer');
-const catalyst = require('zcatalyst-sdk-node');
 
-// Data Store table that durably holds every captured lead. Create a table with
-// this name in Catalyst (columns can be simple text/varchar). If the table or
-// SDK is unavailable, capture fails soft — we log it and still proceed so the
-// user is never blocked, and the notification email is the backup path.
-const LEADS_TABLE = 'Leads';
-
-async function captureLead(req, record) {
+// Lead durability strategy:
+//  1) Every lead is written to the function logs as a single greppable,
+//     alert-friendly line tagged "LEAD_CAPTURE" (set a Catalyst log alert on it).
+//  2) Every lead is pushed into the Avoryx CRM (Sangani Group tenant) via the
+//     web-to-lead API, tagged by originating website so the CRM UI can filter.
+//  3) A branded notification email is sent (best-effort).
+// All three are independent + fail-soft, so a lead is never lost.
+function captureLead(record) {
     try {
-        const app = catalyst.initialize(req);
-        const datastore = app.datastore();
-        const table = datastore.table(LEADS_TABLE);
-        // Column names must exist in the table; keep them short + text.
-        await table.insertRow({
-            Name: record.name,
-            Email: record.email,
-            Phone: record.phone,
-            Company: record.company,
-            Service: record.service,
-            Budget: record.budget,
-            Message: record.message,
-            Product: record.product,
-            Source: record.source,
-            Stack: record.stack,
-            IP: record.ip,
-            Status: record.status,
-        });
-        console.log('Lead captured to Data Store:', record.email);
+        console.log('LEAD_CAPTURE ' + JSON.stringify({ at: new Date().toISOString(), ...record }));
         return true;
     } catch (err) {
-        // Fail soft — never block the user because storage hiccuped. The email
-        // notification is the backup, and this is logged for recovery.
-        console.error('captureLead failed (lead still emailed):', err && err.message, JSON.stringify(record));
+        console.error('LEAD_CAPTURE_LOG_FAILED', err && err.message);
+        return false;
+    }
+}
+
+// Push the lead into the Avoryx CRM (Sangani Group tenant) via the web-to-lead
+// API. SOC2-safe: the token lives only in the Catalyst env (never in code / the
+// browser), the call is server-to-server, and the API pins the lead to the
+// token's tenant_id. Fails soft — logs + email are the backup paths.
+//   Required env: AVORYX_LEAD_URL (e.g. https://avoryx.sanganigroup.in/api/crm/leads)
+//                 AVORYX_LEAD_TOKEN (a tenant API token with write:leads scope)
+async function pushLeadToCrm(record, isAvoryx) {
+    const url = process.env.AVORYX_LEAD_URL;
+    const token = process.env.AVORYX_LEAD_TOKEN;
+    if (!url || !token) {
+        console.log('CRM push skipped (AVORYX_LEAD_URL / AVORYX_LEAD_TOKEN not set)');
+        return false;
+    }
+    // Distinguish which website the lead came from via the CRM's `source` field,
+    // which is natively filterable in the Avoryx CRM UI.
+    const site = isAvoryx ? 'ProductWebsite' : 'EnterpriseWebsite';
+    const notesParts = [
+        record.message,
+        record.service ? `Service/Product: ${record.service}` : '',
+        record.budget ? `Budget/Team size: ${record.budget}` : '',
+        record.stack ? `Tools today: ${record.stack}` : '',
+        record.source ? `Form: ${record.source}` : '',
+    ].filter(Boolean);
+    try {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 8000);
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+                name: record.name,
+                email: record.email,
+                phone: record.phone,
+                company: record.company,
+                source: site,
+                notes: notesParts.join('\n'),
+            }),
+        });
+        clearTimeout(t);
+        if (!resp.ok) {
+            console.error('CRM push non-OK:', resp.status);
+            return false;
+        }
+        console.log('CRM push OK for', record.email, '(', site, ')');
+        return true;
+    } catch (err) {
+        console.error('CRM push failed (lead still logged + emailed):', err && err.message);
         return false;
     }
 }
@@ -166,8 +198,6 @@ module.exports = async (req, res) => {
 
         const body = await getRequestBody(req);
 
-        console.log('PARSED BODY:', body);
-
         if (typeof body === 'string') {
             try {
                 body = JSON.parse(body);
@@ -191,11 +221,6 @@ module.exports = async (req, res) => {
             stack,     // Avoryx: tools the prospect uses today
         } = body || {};
 
-        console.log(name);
-        console.log(service);
-        console.log(message);
-        console.log(recaptchaToken);
-
         if (!name || !email || !service || !message) {
             // Friendly, specific — never a raw "error" string on a public site.
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -218,7 +243,7 @@ module.exports = async (req, res) => {
             ip,
             status: 'captured',
         };
-        const captured = await captureLead(req, leadRecord);
+        const captured = captureLead(leadRecord);
 
         /* -------------------- reCAPTCHA --------------------
          * We verify for spam signal, but a low score never DISCARDS a real person's
@@ -238,12 +263,21 @@ module.exports = async (req, res) => {
             },
         });
 
-        /* -------------------- Branded email -------------------- */
-        // Auto-detect which product/site the lead came from so the email is
-        // branded accordingly (one function serves both sites).
+        // Auto-detect which product/site the lead came from (used for CRM source
+        // tagging + email branding). One function serves both sites.
         const isAvoryx =
             String(product || '').toLowerCase() === 'avoryx' ||
             String(service || '').toLowerCase() === 'avoryx';
+
+        /* -------------------- CRM push (Avoryx, Sangani tenant) --------------------
+         * Only push genuine, within-rate submissions so the CRM isn't polluted by
+         * obvious bots. The lead is already logged either way. */
+        let crmPushed = false;
+        if (isHuman && withinRate) {
+            crmPushed = await pushLeadToCrm(leadRecord, isAvoryx);
+        }
+
+        /* -------------------- Branded email -------------------- */
 
         const brand = isAvoryx
             ? {
@@ -369,6 +403,7 @@ module.exports = async (req, res) => {
         return res.end(JSON.stringify({
             ok: true,
             captured,
+            crmPushed,
             emailed,
             message: `Thank you, ${String(name).split(' ')[0]}! We've received your details and our team will be in touch shortly.`,
         }));
